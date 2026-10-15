@@ -227,9 +227,19 @@ static unsigned long get_time(void) {
 #define X_NEG  (0x10)
 #define X_POS  (0x20)
 
-// Test all but Z_NEG (for No Near Plane microcodes)
-#define CLIP_TEST_FLAGS ( X_POS | X_NEG | Y_POS | Y_NEG | Z_POS | Z_NEG)
-//#define CLIP_TEST_FLAGS ( Z_POS | Z_NEG ) /* Faster but worse */
+/* The GE draws X/Y overhang past the screen edge itself (it scissors), and
+ * only breaks once a vertex leaves its 4096x4096 coordinate space, which is
+ * about 8x the screen width from the centre. So X/Y only need software
+ * clipping against a guard band well inside that limit. The same flags,
+ * shifted by GUARD_SHIFT, mark vertices outside the guard band. Z still has
+ * to be clipped exactly. */
+#define GUARD_BAND 3.0f
+#define GUARD_SHIFT 8
+
+// Vertex is outside the view on these sides (used for trivial rejection)
+#define REJECT_FLAGS ( X_POS | X_NEG | Y_POS | Y_NEG | Z_POS | Z_NEG)
+// Triangle needs software clipping if any vertex has one of these
+#define CLIP_TEST_FLAGS ( Z_POS | Z_NEG | ((X_POS | X_NEG | Y_POS | Y_NEG) << GUARD_SHIFT))
 
 static inline float vec3_dot(const float *lhs, const float *rhs){
     return (lhs[0]*rhs[0]) + (lhs[1]*rhs[1]) + (lhs[2]*rhs[2]);
@@ -278,10 +288,10 @@ void gfx_clip_interpolate_vert(struct LoadedVertex* out, const struct  LoadedVer
 static const float NDCPlane[6][4] =
 {
 	{  0.f,  0.f,  1.f, -1.f },	// near
-	{  1.f,  0.f,  0.f, -1.f },	// left
-	{ -1.f,  0.f,  0.f, -1.f },	// right
-	{  0.f,  1.f,  0.f, -1.f },	// bottom
-	{  0.f, -1.f,  0.f, -1.f },	// top
+	{  1.f,  0.f,  0.f, -GUARD_BAND },	// left
+	{ -1.f,  0.f,  0.f, -GUARD_BAND },	// right
+	{  0.f,  1.f,  0.f, -GUARD_BAND },	// bottom
+	{  0.f, -1.f,  0.f, -GUARD_BAND },	// top
 	{  0.f,  0.f, -1.f, -1.f }	// far
 };
 
@@ -502,7 +512,24 @@ static struct ColorCombiner *gfx_lookup_or_create_color_combiner(uint32_t cc_id)
 }
 
 extern int gfx_vram_space_available(void);
+extern int texman_texture_slot_available(void);
 extern void texman_clear(void);
+extern void gfx_scegu_sync_texture_cache(void);
+
+/* Drop every cached texture. The GE may still be drawing with them, so wait
+ * for it before the texture memory is reused. The node pool and the texture
+ * manager's slot table are always cleared together so their IDs stay in step. */
+static void gfx_texture_cache_clear(void) {
+    gfx_flush();
+    gfx_scegu_sync_texture_cache();
+    texman_clear();
+    gfx_texture_cache.pool_pos = 0;
+    memset(gfx_texture_cache.pool, 0, sizeof(gfx_texture_cache.pool));
+    memset(gfx_texture_cache.hashmap, 0, sizeof(gfx_texture_cache.hashmap));
+    /* The other tile may point at a node that was just wiped. */
+    rdp.textures_changed[0] = true;
+    rdp.textures_changed[1] = true;
+}
 
 static bool gfx_texture_cache_lookup(int tile, struct TextureHashmapNode **n, const uint8_t *orig_addr, uint32_t fmt, uint32_t siz) {
     size_t hash = (uintptr_t)orig_addr;
@@ -517,26 +544,14 @@ static bool gfx_texture_cache_lookup(int tile, struct TextureHashmapNode **n, co
         }
         node = &(*node)->next;
     }
-    if(!gfx_vram_space_available()) {
-        texman_clear();
-
-        // Pool is full. We just invalidate everything and start over.
-        gfx_texture_cache.pool_pos = 0;
-        memset(gfx_texture_cache.pool, 0, sizeof(gfx_texture_cache.pool));
+    if (!gfx_vram_space_available() || !texman_texture_slot_available()
+        || gfx_texture_cache.pool_pos == sizeof(gfx_texture_cache.pool) / sizeof(struct TextureHashmapNode)) {
+        // Texture memory or the node pool is full. Invalidate everything and start over.
+        gfx_texture_cache_clear();
         node = &gfx_texture_cache.hashmap[hash];
-        //puts("Clearing texture cache");
-    }
-    if (gfx_texture_cache.pool_pos == sizeof(gfx_texture_cache.pool) / sizeof(struct TextureHashmapNode)) {
-        // Pool is full. We just invalidate everything and start over.
-        gfx_texture_cache.pool_pos = 0;
-        memset(gfx_texture_cache.pool, 0, sizeof(gfx_texture_cache.pool));
-        node = &gfx_texture_cache.hashmap[hash];
-        //puts("Clearing texture cache");
     }
     *node = &gfx_texture_cache.pool[gfx_texture_cache.pool_pos++];
-    if ((*node)->texture_addr == NULL) {
-        (*node)->texture_id = gfx_rapi->new_texture();
-    }
+    (*node)->texture_id = gfx_rapi->new_texture();
     /*@Note: unneeded due to sequential GE flow */
     //gfx_rapi->select_texture(tile, (*node)->texture_id);
     gfx_rapi->set_sampler_parameters(tile, false, 0, 0);
@@ -574,48 +589,47 @@ static void import_texture_rgba32(int tile) {
     gfx_rapi->upload_texture(rdp.loaded_texture[tile].addr, width, height, GU_PSM_8888);
 }
 
+/* PSP 16-bit texel layouts: 4444 is A[15:12] B[11:8] G[7:4] R[3:0],
+ * 5551 is A[15] B[14:10] G[9:5] R[4:0]. The 4-bit intensity formats and the
+ * N64's RGBA5551 palettes fit these exactly, at half the size of 8888. */
+#define PSP_4444(i, a) ((uint16_t)(((a) << 12) | ((i) << 8) | ((i) << 4) | (i)))
+
+static inline uint16_t n64_5551_to_psp(const uint8_t *p) {
+    const uint16_t col16 = (p[0] << 8) | p[1]; // Big endian load
+    return ((col16 & 1) << 15) | (((col16 >> 1) & 0x1f) << 10) | (((col16 >> 6) & 0x1f) << 5) | (col16 >> 11);
+}
+
 static void import_texture_ia4(int tile) {
-    uint8_t rgba32_buf[32768] __attribute__ ((aligned(4)));
-    
+    uint16_t buf16[8192] __attribute__ ((aligned(16)));
+
     for (uint32_t i = 0; i < rdp.loaded_texture[tile].size_bytes * 2; i++) {
         uint8_t byte = rdp.loaded_texture[tile].addr[i / 2];
         uint8_t part = (byte >> (4 - (i % 2) * 4)) & 0xf;
         uint8_t intensity = part >> 1;
         uint8_t alpha = part & 1;
-        uint8_t r = intensity;
-        uint8_t g = intensity;
-        uint8_t b = intensity;
-        rgba32_buf[4*i + 0] = SCALE_3_8(r);
-        rgba32_buf[4*i + 1] = SCALE_3_8(g);
-        rgba32_buf[4*i + 2] = SCALE_3_8(b);
-        rgba32_buf[4*i + 3] = alpha ? 255 : 0;
+        // 3-bit intensity to 4 bits
+        buf16[i] = PSP_4444((intensity << 1) | (intensity >> 2), alpha ? 0xf : 0);
     }
-    
+
     uint32_t width = rdp.texture_tile.line_size_bytes * 2;
     uint32_t height = rdp.loaded_texture[tile].size_bytes / rdp.texture_tile.line_size_bytes;
-    
-    gfx_rapi->upload_texture(rgba32_buf, width, height, GU_PSM_8888);
+
+    gfx_rapi->upload_texture((const uint8_t *)buf16, width, height, GU_PSM_4444);
 }
 
 static void import_texture_ia8(int tile) {
-    uint8_t rgba32_buf[16384]__attribute__ ((aligned(4)));
-    
+    uint16_t buf16[4096] __attribute__ ((aligned(16)));
+
     for (uint32_t i = 0; i < rdp.loaded_texture[tile].size_bytes; i++) {
         uint8_t intensity = rdp.loaded_texture[tile].addr[i] >> 4;
         uint8_t alpha = rdp.loaded_texture[tile].addr[i] & 0xf;
-        uint8_t r = intensity;
-        uint8_t g = intensity;
-        uint8_t b = intensity;
-        rgba32_buf[4*i + 0] = SCALE_4_8(r);
-        rgba32_buf[4*i + 1] = SCALE_4_8(g);
-        rgba32_buf[4*i + 2] = SCALE_4_8(b);
-        rgba32_buf[4*i + 3] = SCALE_4_8(alpha);
+        buf16[i] = PSP_4444(intensity, alpha);
     }
-    
+
     uint32_t width = rdp.texture_tile.line_size_bytes;
     uint32_t height = rdp.loaded_texture[tile].size_bytes / rdp.texture_tile.line_size_bytes;
-    
-    gfx_rapi->upload_texture(rgba32_buf, width, height, GU_PSM_8888);
+
+    gfx_rapi->upload_texture((const uint8_t *)buf16, width, height, GU_PSM_4444);
 }
 
 static void import_texture_ia16(int tile) {
@@ -640,25 +654,18 @@ static void import_texture_ia16(int tile) {
 }
 
 static void import_texture_i4(int tile) {
-    uint8_t rgba32_buf[32768];
+    uint16_t buf16[8192] __attribute__ ((aligned(16)));
 
     for (uint32_t i = 0; i < rdp.loaded_texture[tile].size_bytes * 2; i++) {
         uint8_t byte = rdp.loaded_texture[tile].addr[i / 2];
-        uint8_t part = (byte >> (4 - (i % 2) * 4)) & 0xf;
-        uint8_t intensity = part;
-        uint8_t r = intensity;
-        uint8_t g = intensity;
-        uint8_t b = intensity;
-        rgba32_buf[4*i + 0] = SCALE_4_8(r);
-        rgba32_buf[4*i + 1] = SCALE_4_8(g);
-        rgba32_buf[4*i + 2] = SCALE_4_8(b);
-        rgba32_buf[4*i + 3] = 255;
+        uint8_t intensity = (byte >> (4 - (i % 2) * 4)) & 0xf;
+        buf16[i] = PSP_4444(intensity, 0xf);
     }
 
     uint32_t width = rdp.texture_tile.line_size_bytes * 2;
     uint32_t height = rdp.loaded_texture[tile].size_bytes / rdp.texture_tile.line_size_bytes;
 
-    gfx_rapi->upload_texture(rgba32_buf, width, height, GU_PSM_8888);
+    gfx_rapi->upload_texture((const uint8_t *)buf16, width, height, GU_PSM_4444);
 }
 
 static void import_texture_i8(int tile) {
@@ -683,48 +690,32 @@ static void import_texture_i8(int tile) {
 
 
 static void import_texture_ci4(int tile) {
-    uint8_t rgba32_buf[32768];
-    
+    uint16_t buf16[8192] __attribute__ ((aligned(16)));
+
     for (uint32_t i = 0; i < rdp.loaded_texture[tile].size_bytes * 2; i++) {
         uint8_t byte = rdp.loaded_texture[tile].addr[i / 2];
         uint8_t idx = (byte >> (4 - (i % 2) * 4)) & 0xf;
-        uint16_t col16 = (rdp.palette[idx * 2] << 8) | rdp.palette[idx * 2 + 1]; // Big endian load
-        uint8_t a = col16 & 1;
-        uint8_t r = col16 >> 11;
-        uint8_t g = (col16 >> 6) & 0x1f;
-        uint8_t b = (col16 >> 1) & 0x1f;
-        rgba32_buf[4*i + 0] = SCALE_5_8(r);
-        rgba32_buf[4*i + 1] = SCALE_5_8(g);
-        rgba32_buf[4*i + 2] = SCALE_5_8(b);
-        rgba32_buf[4*i + 3] = a ? 255 : 0;
+        buf16[i] = n64_5551_to_psp(&rdp.palette[idx * 2]);
     }
-    
+
     uint32_t width = rdp.texture_tile.line_size_bytes * 2;
     uint32_t height = rdp.loaded_texture[tile].size_bytes / rdp.texture_tile.line_size_bytes;
-    
-    gfx_rapi->upload_texture(rgba32_buf, width, height, GU_PSM_8888);
+
+    gfx_rapi->upload_texture((const uint8_t *)buf16, width, height, GU_PSM_5551);
 }
 
 static void import_texture_ci8(int tile) {
-    uint8_t rgba32_buf[16384];
-    
+    uint16_t buf16[4096] __attribute__ ((aligned(16)));
+
     for (uint32_t i = 0; i < rdp.loaded_texture[tile].size_bytes; i++) {
         uint8_t idx = rdp.loaded_texture[tile].addr[i];
-        uint16_t col16 = (rdp.palette[idx * 2] << 8) | rdp.palette[idx * 2 + 1]; // Big endian load
-        uint8_t a = col16 & 1;
-        uint8_t r = col16 >> 11;
-        uint8_t g = (col16 >> 6) & 0x1f;
-        uint8_t b = (col16 >> 1) & 0x1f;
-        rgba32_buf[4*i + 0] = SCALE_5_8(r);
-        rgba32_buf[4*i + 1] = SCALE_5_8(g);
-        rgba32_buf[4*i + 2] = SCALE_5_8(b);
-        rgba32_buf[4*i + 3] = a ? 255 : 0;
+        buf16[i] = n64_5551_to_psp(&rdp.palette[idx * 2]);
     }
-    
+
     uint32_t width = rdp.texture_tile.line_size_bytes;
     uint32_t height = rdp.loaded_texture[tile].size_bytes / rdp.texture_tile.line_size_bytes;
-    
-    gfx_rapi->upload_texture(rgba32_buf, width, height, GU_PSM_8888);
+
+    gfx_rapi->upload_texture((const uint8_t *)buf16, width, height, GU_PSM_5551);
 }
 
 static void import_texture(int tile) {
@@ -1017,6 +1008,11 @@ static void gfx_sp_vertex(size_t n_vertices, size_t dest_index, const Vtx *verti
         if (y > w) d->clip_rej |= Y_NEG;
         if (z < -w) d->clip_rej |= Z_POS;
         if (z > w) d->clip_rej |= Z_NEG;
+        const float gw = w * GUARD_BAND;
+        if (x < -gw) d->clip_rej |= X_POS << GUARD_SHIFT;
+        if (x > gw) d->clip_rej |= X_NEG << GUARD_SHIFT;
+        if (y < -gw) d->clip_rej |= Y_POS << GUARD_SHIFT;
+        if (y > gw) d->clip_rej |= Y_NEG << GUARD_SHIFT;
 
         d->x = v->ob[0];
         d->y = v->ob[1];
@@ -1067,7 +1063,7 @@ static void gfx_sp_tri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx) {
     struct LoadedVertex *v3 = &rsp.loaded_vertices[vtx3_idx];
     struct LoadedVertex *v_arr[3] = {v1, v2, v3};
 
-    if (v1->clip_rej & v2->clip_rej & v3->clip_rej) {
+    if (v1->clip_rej & v2->clip_rej & v3->clip_rej & REJECT_FLAGS) {
         // The whole triangle lies outside the visible area
         return;
     }
@@ -1103,7 +1099,7 @@ static void gfx_sp_tri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx) {
     struct LoadedVertex _clipped_vertices[18];
     struct LoadedVertex *ptr_clipped_vertices[18];
 
-    if((v1->clip_rej || v2->clip_rej || v3->clip_rej) & CLIP_TEST_FLAGS) {
+    if((v1->clip_rej | v2->clip_rej | v3->clip_rej) & CLIP_TEST_FLAGS) {
         gfx_clip_single_vert(_clipped_vertices, &clipped_vertices_num, v_arr);
 
         if(!clipped_vertices_num){
@@ -1166,7 +1162,12 @@ static void gfx_sp_tri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx) {
     if (use_alpha) cc_id |= SHADER_OPT_ALPHA;
     if (use_fog) cc_id |= SHADER_OPT_FOG;
     if (texture_edge) cc_id |= SHADER_OPT_TEXTURE_EDGE;
-    if (use_noise) cc_id |= SHADER_OPT_NOISE;
+    /* The PSP has no equivalent of the N64's dithered alpha (G_AC_DITHER),
+     * which SM64 uses for fades such as Mario warping. Keeping the flag gave
+     * these draws a shader ID the backend swaps for a textured one, so
+     * untextured parts (Mario's clothes) vanished. Draw them as ordinary
+     * alpha blending instead. */
+    (void)use_noise;
     
     if (!use_alpha) {
         cc_id &= ~0xfff000;
@@ -1294,7 +1295,7 @@ static void gfx_sp_tri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx) {
 
         /*@Note: Blue Star color */
         if((rendering_state.shader_program->shader_id == 0x01200200)){
-            memcpy(&buf_vbo[buf_num_vert].color, &clipped_vertices[0]->color, sizeof(struct RGBA));
+            memcpy(&buf_vbo[buf_num_vert].color, &clipped_vertices[i]->color, sizeof(struct RGBA));
             if(rdp.env_color.a != 255){
                 buf_vbo[buf_num_vert].color.a = rdp.env_color.a;
             }
@@ -1366,7 +1367,12 @@ static void gfx_sp_tri1_2d(uint8_t vtx1_idx, uint8_t vtx2_idx, UNUSED uint8_t vt
     if (use_alpha) cc_id |= SHADER_OPT_ALPHA;
     if (use_fog) cc_id |= SHADER_OPT_FOG;
     if (texture_edge) cc_id |= SHADER_OPT_TEXTURE_EDGE;
-    if (use_noise) cc_id |= SHADER_OPT_NOISE;
+    /* The PSP has no equivalent of the N64's dithered alpha (G_AC_DITHER),
+     * which SM64 uses for fades such as Mario warping. Keeping the flag gave
+     * these draws a shader ID the backend swaps for a textured one, so
+     * untextured parts (Mario's clothes) vanished. Draw them as ordinary
+     * alpha blending instead. */
+    (void)use_noise;
     
     if (!use_alpha) {
         cc_id &= ~0xfff000;
@@ -1785,6 +1791,8 @@ static void gfx_dp_set_fill_color(uint32_t packed_color) {
     rdp.fill_color.a = a * 255;
 }
 
+static bool rect_full_width;
+
 static void gfx_draw_rectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_t lry) {
     uint32_t saved_other_mode_h = rdp.other_mode_h;
     uint32_t cycle_type = (rdp.other_mode_h & (3U << G_MDSFT_CYCLETYPE));
@@ -1809,6 +1817,10 @@ static void gfx_draw_rectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_t lr
 
     ulxf = (ulxf*240)+240;
     lrxf = (lrxf*240)+240;
+    if (rect_full_width) {
+        ulxf = 0.0f;
+        lrxf = 480.0f;
+    }
 
     ulyf = (ulyf*136)+136;
     lryf = (lryf*136)+136;
@@ -1898,7 +1910,11 @@ static void gfx_dp_texture_rectangle(int32_t ulx, int32_t uly, int32_t lrx, int3
 }
 
 static void gfx_dp_fill_rectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_t lry) {
-    if (rdp.color_image_address == rdp.z_buf_address) {
+    /* The PSP build compiles out the game's gDPSetColorImage/gDPSetDepthImage
+     * calls, so both addresses stay NULL. Only treat the fill as a Z-buffer
+     * clear when they were actually set; otherwise every fill (such as the
+     * white star select background) was skipped. */
+    if (rdp.color_image_address != NULL && rdp.color_image_address == rdp.z_buf_address) {
         // Don't clear Z buffer here since we already did it with glClear
         return;
     }
@@ -1917,7 +1933,11 @@ static void gfx_dp_fill_rectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_t
     
     uint32_t saved_combine_mode = rdp.combine_mode;
     gfx_dp_set_combine_mode(color_comb(0, 0, 0, G_CCMUX_SHADE), color_comb(0, 0, 0, G_ACMUX_SHADE));
+    // A fill spanning the whole N64 screen width (a background) should cover
+    // the whole widescreen PSP display, not just the 4:3 middle.
+    rect_full_width = (ulx <= 0 && lrx >= ((SCREEN_WIDTH - 1) << 2));
     gfx_draw_rectangle(ulx, uly, lrx, lry);
+    rect_full_width = false;
     rdp.combine_mode = saved_combine_mode;
 }
 

@@ -16,6 +16,7 @@
 #include <pspgu.h>
 #include <pspgum.h>
 #include <string.h>
+#include <malloc.h>
 
 #include "psp_texture_manager.h"
 
@@ -159,6 +160,20 @@ unsigned int __attribute__((aligned(64))) list[262144 * 2];
 
 static unsigned int staticOffset = 0;
 unsigned int scegu_fog_color = 0;
+
+/* VRAM index of the last swap, used to keep the GE from drawing into a
+ * buffer the display is still scanning out. */
+static unsigned int swap_vcount = 0;
+static bool swap_pending = false;
+
+/* The texture cache reuses the same memory as soon as it is cleared. Wait
+ * until every draw that may still sample the old textures has finished,
+ * then continue the frame in a fresh list. */
+void gfx_scegu_sync_texture_cache(void) {
+    sceGuFinish();
+    sceGuSync(0, 0);
+    sceGuStart(GU_DIRECT, list);
+}
 
 static unsigned int getMemorySize(unsigned int width, unsigned int height, unsigned int psm) {
     switch (psm) {
@@ -479,6 +494,7 @@ static inline int nextpow2(int v) {
     v |= v >> 1;
     v |= v >> 2;
     v |= v >> 4;
+    v |= v >> 8;
     v++;
     return v;
 }
@@ -505,7 +521,9 @@ static void gfx_scegu_set_sampler_parameters(const int tile, const bool linear_f
 }
 
 static void gfx_scegu_select_texture(int tile, unsigned int texture_id) {
-    if (tmu_state[tile].tex != texture_id) {
+    /* Uploads bind the new texture themselves, so compare with what the
+     * texture manager last bound rather than what this tile last selected. */
+    if (texman_get_bound() != texture_id) {
         tmu_state[tile].tex = texture_id;
         texman_bind_tex(texture_id);
         gfx_scegu_set_sampler_parameters(tile, false, 0, 0);
@@ -581,16 +599,37 @@ static void gfx_scegu_resample_8bit(const unsigned char *in, int inwidth, int in
 }
 
 static void gfx_scegu_upload_texture(const uint8_t *rgba32_buf, int width, int height, unsigned int type) {
-    if (ispow2(width) && ispow2(height)) {
+    const int bytes_per_pixel = (type == GU_PSM_8888) ? 4 : ((type == GU_PSM_T8) ? 1 : 2);
+    /* Swizzled textures are stored in 16-byte by 8-row blocks. Anything
+     * narrower or shorter would be skipped by swizzle_fast and sampled as
+     * garbage, so stretch those up. UVs are normalized, so this is invisible
+     * with point sampling. */
+    const int min_width = 16 / bytes_per_pixel;
+    const int min_height = 8;
+
+    if (width <= 0 || height <= 0) {
+        return;
+    }
+
+    if (ispow2(width) && ispow2(height) && width >= min_width && height >= min_height) {
         texman_upload_swizzle(width, height, type, (void *) rgba32_buf);
     } else {
         int scaled_width = nextpow2(width);
         int scaled_height = nextpow2(height);
+        if (scaled_width < min_width) {
+            scaled_width = min_width;
+        }
+        if (scaled_height < min_height) {
+            scaled_height = min_height;
+        }
+        if (scaled_width * scaled_height * bytes_per_pixel > (int) sizeof(scaled)) {
+            return;
+        }
 
         if (type == GU_PSM_8888) {
             gfx_scegu_resample_32bit((const unsigned int *) rgba32_buf, width, height, (void *) scaled, scaled_width, scaled_height);
             texman_upload_swizzle(scaled_width, scaled_height, type, (void *) scaled);
-        } else if (type == GU_PSM_5551) {
+        } else if (type == GU_PSM_5551 || type == GU_PSM_4444) {
             gfx_scegu_resample_16bit((const unsigned short *) rgba32_buf, width, height, (void *) scaled, scaled_width, scaled_height);
             texman_upload_swizzle(scaled_width, scaled_height, type, (void *) scaled);
         } else {
@@ -694,6 +733,8 @@ void gfx_scegu_draw_triangles_2d(float buf_vbo[], UNUSED size_t buf_vbo_len, UNU
 
 static void gfx_scegu_init(void) {
     sceGuInit();
+    /* Buffer swaps take effect at the next vsync, never mid-scanout. */
+    guSwapBuffersBehaviour(PSP_DISPLAY_SETBUF_NEXTFRAME);
 
     void *fbp0 = getStaticVramBuffer(BUF_WIDTH, SCR_HEIGHT, GU_PSM_5650);
     void *fbp1 = getStaticVramBuffer(BUF_WIDTH, SCR_HEIGHT, GU_PSM_5650);
@@ -729,9 +770,16 @@ static void gfx_scegu_init(void) {
     sceDisplayWaitVblankStart();
     sceGuDisplay(GU_TRUE);
 
-    void *texman_buffer = getStaticVramBufferBytes(TEXMAN_BUFFER_SIZE);
+    /* Give the texture cache all of the VRAM left after the frame and depth
+     * buffers (about 1.2 MB). The old fixed 1 MB left some of it unused. */
+    unsigned int vram_left = sceGeEdramGetSize() > staticOffset ? sceGeEdramGetSize() - staticOffset : 0;
+    unsigned int texman_size = vram_left > TEXMAN_BUFFER_SIZE ? TEXMAN_BUFFER_SIZE : vram_left;
+    void *texman_buffer = getStaticVramBufferBytes(texman_size);
     void *texman_aligned = (void *) ((((unsigned int) texman_buffer + TEX_ALIGNMENT - 1) / TEX_ALIGNMENT) * TEX_ALIGNMENT);
-    texman_reset(texman_aligned, TEXMAN_BUFFER_SIZE);
+    texman_reset(texman_aligned, texman_size - TEX_ALIGNMENT);
+    /* Overflow area in main RAM. If it cannot be allocated the cache simply
+     * flushes more often, as before. */
+    texman_set_ram_buffer(memalign(64, TEXMAN_RAM_BUFFER_SIZE), TEXMAN_RAM_BUFFER_SIZE);
     if (!texman_buffer) {
         char msg[32];
         sprintf(msg, "OUT OF MEMORY!\n");
@@ -742,6 +790,14 @@ static void gfx_scegu_init(void) {
 }
 
 static void gfx_scegu_start_frame(void) {
+    /* The swap from the previous frame takes effect at the next vblank. If
+     * that has not happened yet, the draw buffer is still on screen, so wait
+     * for it before clearing. */
+    if (swap_pending && sceDisplayGetVcount() == swap_vcount) {
+        sceDisplayWaitVblankStart();
+    }
+    swap_pending = false;
+
     sceGuStart(GU_DIRECT, list);
     sceGuDisable(GU_SCISSOR_TEST);
     sceGuDepthMask(GU_TRUE); // Must be set to clear Z-buffer
@@ -782,10 +838,22 @@ void gfx_scegu_on_resize(void) {
 }
 
 static void gfx_scegu_end_frame(void) {
+    /* Frames are paced to every second vblank (30 fps, like the N64). The old
+     * code always waited for the next vblank after the frame finished, so a
+     * frame that ran even slightly long dropped straight to 20 fps (and the
+     * game to 2/3 speed). Now a late frame is shown at the next vblank
+     * without making the next frame wait as well. */
+    static unsigned int last_swap_vcount = 0;
+
     sceGuFinish();
     sceGuSync(0, 0);
-    sceDisplayWaitVblankStart();
+    while ((unsigned int) (sceDisplayGetVcount() - last_swap_vcount) < 2) {
+        sceDisplayWaitVblankStart();
+    }
     sceGuSwapBuffers();
+    last_swap_vcount = sceDisplayGetVcount();
+    swap_vcount = last_swap_vcount;
+    swap_pending = true;
 }
 
 static void gfx_scegu_finish_render(void) {

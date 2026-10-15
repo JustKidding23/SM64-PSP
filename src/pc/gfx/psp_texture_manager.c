@@ -18,10 +18,14 @@
 #include <string.h>
 #include <stdlib.h>
 
-static struct PSP_Texture textures[512];
+static struct PSP_Texture textures[TEXMAN_MAX_TEXTURES];
 static void *psp_tex_buffer = NULL;
 static void *psp_tex_buffer_start = NULL;
 static void *psp_tex_buffer_max = NULL;
+static void *psp_tex_vram_max = NULL;
+/* Optional overflow area in main RAM, used once the VRAM part is full. */
+static void *psp_tex_ram_start = NULL;
+static void *psp_tex_ram_max = NULL;
 static unsigned int psp_tex_number = 0;
 unsigned int psp_tex_bound = 0;
 
@@ -109,8 +113,9 @@ int texman_inited(void) {
 void texman_reset(void *buf, unsigned int size) {
     memset(textures, 0, sizeof(textures));
     psp_tex_number = 0;
+    psp_tex_bound = 0;
     psp_tex_buffer = psp_tex_buffer_start = buf;
-    psp_tex_buffer_max = buf + size;
+    psp_tex_buffer_max = psp_tex_vram_max = buf + size;
 #ifdef DEBUG
     char msg[64];
     sprintf(msg, "TEXMAN reset @ %p size %d bytes\n", buf, size);
@@ -121,7 +126,9 @@ void texman_reset(void *buf, unsigned int size) {
 void texman_clear(void) {
     memset(textures, 0, sizeof(textures));
     psp_tex_number = 0;
+    psp_tex_bound = 0;
     psp_tex_buffer = psp_tex_buffer_start;
+    psp_tex_buffer_max = psp_tex_vram_max;
 #ifdef DEBUG
     char msg[64];
     sprintf(msg, "TEXMAN clear %p size %d bytes!\n", psp_tex_buffer, TEXMAN_BUFFER_SIZE);
@@ -134,8 +141,29 @@ void texman_set_buffer(void *buf, unsigned int size) {
     psp_tex_buffer_max = buf + size;
 }
 
+void texman_set_ram_buffer(void *buf, unsigned int size) {
+    psp_tex_ram_start = buf;
+    psp_tex_ram_max = buf ? buf + size : NULL;
+}
+
+static inline int texman_in_ram(void) {
+    return psp_tex_ram_start != NULL && psp_tex_buffer >= psp_tex_ram_start && psp_tex_buffer <= psp_tex_ram_max;
+}
+
+/* True while either the VRAM part or the RAM overflow can take another
+ * upload of the largest size SM64 produces. */
 int gfx_vram_space_available(void) {
-    return (psp_tex_buffer_max - psp_tex_buffer) > (32 * 1024);
+    if ((psp_tex_buffer_max - psp_tex_buffer) > TEXMAN_MAX_UPLOAD_SIZE) {
+        return 1;
+    }
+    if (psp_tex_ram_start != NULL && !texman_in_ram()) {
+        return 1;
+    }
+    return 0;
+}
+
+int texman_texture_slot_available(void) {
+    return psp_tex_number + 1 < TEXMAN_MAX_TEXTURES;
 }
 
 unsigned char *texman_get_tex_data(unsigned int num) {
@@ -148,6 +176,18 @@ unsigned char texman_get_tex_type(unsigned int num) {
 
 struct PSP_Texture *texman_reserve_memory(int width, int height, unsigned int type) {
     int tex_size = getMemorySize(width, height, type);
+    if (psp_tex_buffer + tex_size > psp_tex_buffer_max) {
+        if (psp_tex_ram_start == NULL || texman_in_ram()) {
+            return NULL;
+        }
+        /* VRAM is full: continue in the RAM overflow area. */
+        psp_tex_buffer = psp_tex_ram_start;
+        psp_tex_buffer_max = psp_tex_ram_max;
+        if (psp_tex_buffer + tex_size > psp_tex_buffer_max) {
+            return NULL;
+        }
+    }
+    textures[psp_tex_number].location = psp_tex_buffer;
     psp_tex_buffer =
         (void *) ((((unsigned int) psp_tex_buffer + tex_size + TEX_ALIGNMENT - 1) / TEX_ALIGNMENT)
                   * TEX_ALIGNMENT);
@@ -160,6 +200,10 @@ struct PSP_Texture *texman_reserve_memory(int width, int height, unsigned int ty
 }
 
 unsigned int texman_create(void) {
+    if (!texman_texture_slot_available()) {
+        /* Callers clear the cache before this can happen; never write past the table. */
+        return 0;
+    }
     psp_tex_number++;
     textures[psp_tex_number] = (struct PSP_Texture){
         location : psp_tex_buffer,
@@ -177,7 +221,13 @@ unsigned int texman_create(void) {
 }
 
 void texman_upload_swizzle(int width, int height, unsigned int type, const void *buffer) {
+    if (psp_tex_number == 0) {
+        return;
+    }
     struct PSP_Texture *current = texman_reserve_memory(width, height, type);
+    if (current == NULL) {
+        return;
+    }
     sceKernelDcacheWritebackRange(buffer, getMemorySize(width, height, type));
     current->width = width;
     current->height = height;
@@ -194,7 +244,13 @@ void texman_upload_swizzle(int width, int height, unsigned int type, const void 
 }
 
 void texman_upload(int width, int height, unsigned int type, const void *buffer) {
+    if (psp_tex_number == 0) {
+        return;
+    }
     struct PSP_Texture *current = texman_reserve_memory(width, height, type);
+    if (current == NULL) {
+        return;
+    }
     sceKernelDcacheWritebackRange(buffer, getMemorySize(width, height, type));
     current->width = width;
     current->height = height;
