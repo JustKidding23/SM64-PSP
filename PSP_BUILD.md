@@ -1,4 +1,4 @@
-# Building SM64 for PSP (modern pspdev toolchain)
+# SM64 PSP: building and changes
 
 This fork builds the PSP port of the Super Mario 64 PC port against a current
 pspdev toolchain. It contains **no Nintendo assets**: you must supply your own
@@ -17,6 +17,14 @@ running on a PSP 3001 with custom firmware.
 - Build fixes for newer compilers: `tools/armips.cpp` includes `<cstdint>`,
   `PSP_HEAP_SIZE_KB` replaces the removed `PSP_HEAP_SIZE_MAX`, and the PSP
   compiler flags add `-fcommon` and `-Wno-error=incompatible-pointer-types`.
+- Renderer performance: smaller texture formats (lossless, half the memory),
+  a texture cache that uses all spare VRAM plus 6 MB of main RAM, software
+  clipping only beyond a 3x guard band, and frame pacing on vblanks so a
+  slightly late frame no longer drops straight to 20 fps. An overclock set by
+  a plugin is no longer lowered.
+- Graphics fixes: texture cache corruption and stale textures, tiny or
+  non-power-of-two textures, fill rectangles (the star select background), and
+  fading objects such as Mario in warps.
 
 ## Requirements
 
@@ -60,8 +68,8 @@ or endorsed by Nintendo.
 
 ## How this was made
 
-The PSP-specific changes in this fork (the save and settings fixes and the
-build fixes for newer compilers) were developed with the help of an AI
+All of the PSP-specific changes in this fork (the save and settings fixes,
+the build fixes for newer compilers, and the renderer work) were developed with the help of an AI
 assistant, Claude by Anthropic. I tested the results by building the project
 and running it on a real PSP 3001. AI-assisted code can contain mistakes, so
 review it before relying on it.

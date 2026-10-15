@@ -1,3 +1,21 @@
+# SM64 PSP
+
+Super Mario 64 running natively on the Sony PSP (not emulated), built from the
+SM64 decompilation and gyrovorbis's PSP port, with fixes and performance work
+for a modern pspdev toolchain. Tested on a PSP 3001 with custom firmware.
+
+**Built with the use of AI:** the changes in this fork were made with Claude
+(Anthropic's AI assistant) and tested on real PSP hardware.
+
+- [Build and install instructions, and what this fork changes](PSP_BUILD.md)
+- You need your own legally obtained US ROM. This repository contains no
+  Nintendo assets.
+- Also by me: [Ocarina of Time PSP](https://github.com/JustKidding23/Ocarina-of-Time-PSP)
+
+The original upstream README follows.
+
+---
+
 # PSP Port of PC
 
 PSP Project Discord: https://discord.gg/5w4B69
