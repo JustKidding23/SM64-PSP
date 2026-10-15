@@ -22,7 +22,8 @@
 #define SCR_WIDTH (480)
 #define SCR_HEIGHT (272)
 
-static int force_30fps = 1;
+/* Frame pacing is done on vblanks in gfx_scegu_end_frame. */
+static int force_30fps = 0;
 static unsigned int last_time = 0;
 int audio_manager_thid = 0;
 
@@ -107,8 +108,12 @@ static void gfx_psp_init(UNUSED const char *game_name, UNUSED bool start_in_full
         sceKernelStartThread(thid, 0, 0);
     }
 
-    scePowerSetClockFrequency(333, 333, 166);
-    sceKernelDelayThread(1000);
+    /* Raise the clock to the stock maximum, but never lower it: an overclock
+     * plugin may already have set the CPU above 333 MHz. */
+    if (scePowerGetCpuClockFrequencyInt() < 333) {
+        scePowerSetClockFrequency(333, 333, 166);
+        sceKernelDelayThread(1000);
+    }
     init_mediaengine();
 
     pspDebugScreenInitEx(0, PSP_DISPLAY_PIXEL_FORMAT_8888, 0);
