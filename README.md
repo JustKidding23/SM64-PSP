@@ -1,16 +1,55 @@
 # SM64 PSP
 
-Super Mario 64 running natively on the Sony PSP (not emulated), built from the
-SM64 decompilation and gyrovorbis's PSP port, with fixes and performance work
-for a modern pspdev toolchain. Tested on a PSP 3001 with custom firmware.
+Super Mario 64 running natively on the Sony PSP. It isn't an emulator: the game is compiled
+for the PSP from the [n64decomp/sm64](https://github.com/n64decomp/sm64) decompilation, by
+way of the [SM64 PC port](https://github.com/sm64-port/sm64-port) and mrneo240's PSP port as
+carried on by [gyrovorbis](https://github.com/gyrovorbis/sm64-port). It's played on a PSP
+3001 with custom firmware (6.61 PRO-C).
 
-**Built with the use of AI:** the changes in this fork were made with Claude
-(Anthropic's AI assistant) and tested on real PSP hardware.
+**Built with AI, openly.** The changes in this fork were made with Claude, Anthropic's AI
+assistant, working in Claude Code alongside the owner of this repository, who tested each
+build on a real PSP. [How this was made](#how-this-was-made) says more. AI-written code can
+contain mistakes, so review it before relying on it.
 
-- [Build and install instructions, and what this fork changes](PSP_BUILD.md)
-- You need your own legally obtained US ROM. This repository contains no
-  Nintendo assets.
-- Also by me: [Ocarina of Time PSP](https://github.com/JustKidding23/Ocarina-of-Time-PSP) and [Pokémon Emerald PSP](https://github.com/JustKidding23/Pokemon-Emerald-PSP)
+**No game files here.** You need your own US ROM of the game, which the build extracts the
+graphics and sound from. What you build contains the game, so keep it to yourself. That's
+also why there's no download.
+
+## Playing it
+
+You need Linux (or WSL), the [pspdev](https://github.com/pspdev/pspdev) toolchain and your
+ROM saved as `baserom.us.z64` in this folder. Then:
+
+```
+make TARGET_PSP=1 -j4
+cp -r psp/textures/* textures/
+make TARGET_PSP=1 -j4 pbp
+```
+
+Copy the folder `build/us_psp/mario64/` to `PSP/GAME/` on the memory stick and start it from
+Game > Memory Stick. [PSP_BUILD.md](PSP_BUILD.md) has the details: the packages to install,
+the ROM's checksum, and where the game keeps its save.
+
+## What this fork changes
+
+- Saves and settings are written in a way that works on a real PSP. The C library's `fopen`
+  couldn't create files there.
+- It builds with a current pspdev toolchain.
+- It's faster: smaller textures, a bigger texture cache, less clipping work, and frames
+  paced on the display so a slightly late frame doesn't drop to 20 a second.
+- Graphics fixes: stale or corrupted textures, tiny textures, the star select background,
+  and fading objects such as Mario in warps.
+
+## How this was made
+
+Claude made these changes in Claude Code in October 2026, directed by the owner
+of this repository, who built each version and ran it on their PSP. The commit messages say
+what each change does and how it was tested.
+
+[CREDITS.md](CREDITS.md) names everyone whose work this is built on.
+
+Also by me: [Ocarina of Time PSP](https://github.com/JustKidding23/Ocarina-of-Time-PSP) and
+[Pokémon Emerald PSP](https://github.com/JustKidding23/Pokemon-Emerald-PSP)
 
 The original upstream README follows.
 
