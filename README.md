@@ -10,7 +10,7 @@ for a modern pspdev toolchain. Tested on a PSP 3001 with custom firmware.
 - [Build and install instructions, and what this fork changes](PSP_BUILD.md)
 - You need your own legally obtained US ROM. This repository contains no
   Nintendo assets.
-- Also by me: [Ocarina of Time PSP](https://github.com/JustKidding23/Ocarina-of-Time-PSP)
+- Also by me: [Ocarina of Time PSP](https://github.com/JustKidding23/Ocarina-of-Time-PSP) and [Pokémon Emerald PSP](https://github.com/JustKidding23/Pokemon-Emerald-PSP)
 
 The original upstream README follows.
 
