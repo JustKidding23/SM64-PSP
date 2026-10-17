@@ -48,6 +48,9 @@ what each change does and how it was tested.
 
 [CREDITS.md](CREDITS.md) names everyone whose work this is built on.
 
+Want to help, or found a problem? [CONTRIBUTING.md](CONTRIBUTING.md) says how. Reports
+from playing on your PSP are as welcome as code.
+
 Also by me: [Ocarina of Time PSP](https://github.com/JustKidding23/Ocarina-of-Time-PSP) and
 [Pokémon Emerald PSP](https://github.com/JustKidding23/Pokemon-Emerald-PSP)
 
