@@ -51,8 +51,9 @@ what each change does and how it was tested.
 Want to help, or found a problem? [CONTRIBUTING.md](CONTRIBUTING.md) says how. Reports
 from playing on your PSP are as welcome as code.
 
-Also by me: [Ocarina of Time PSP](https://github.com/JustKidding23/Ocarina-of-Time-PSP) and
-[Pokémon Emerald PSP](https://github.com/JustKidding23/Pokemon-Emerald-PSP)
+Also by me: [Ocarina of Time PSP](https://github.com/JustKidding23/Ocarina-of-Time-PSP),
+[Pokémon Emerald PSP](https://github.com/JustKidding23/Pokemon-Emerald-PSP) and
+[Pokémon FireRed PSP](https://github.com/JustKidding23/Pokemon-FireRed-PSP)
 
 The original upstream README follows.
 
